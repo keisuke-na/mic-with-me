@@ -41,6 +41,10 @@
   }
 }
 
-button {
+/* button {
   font-size: calc(10px + 2vmin);
+} */
+
+table, tbody , tr, td {
+  border: 1px solid black
 }
