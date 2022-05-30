@@ -96,6 +96,14 @@ function App() {
 
   const startUserMediaStream = async (videoRef: RefObject<HTMLVideoElement>) => {
     const mediaStream = await navigator.mediaDevices.getUserMedia({ video: onCamera, audio: onMicroPhone })
+
+    // Connection オブジェクトに Track を追加する
+    if (peerConnection.current) {
+      mediaStream.getTracks().map((track) => {
+        peerConnection.current!.addTrack(track, mediaStream)
+      })
+    }
+
     setStreamToElement(videoRef, mediaStream)
   }
 
@@ -105,6 +113,19 @@ function App() {
       // 古いトラッカーを停止させ初期化する処理 (HTML要素のstreamの解除だけではgetしたUserMediaは停止しない)
       if (mediaStream.getVideoTracks()[0]) mediaStream.getVideoTracks()[0].stop()
       if (mediaStream.getAudioTracks()[0]) mediaStream.getAudioTracks()[0].stop()
+    }
+
+    if (peerConnection.current && mediaStream) {
+      const senders = peerConnection.current.getSenders()
+      const videoTrack = mediaStream.getVideoTracks()[0]
+      const audioTrack = mediaStream.getAudioTracks()[0]
+      senders.map((sender) => {
+        if (sender.track) {
+          if (videoTrack.id === sender.track.id || audioTrack.id === sender.track.id) {
+            peerConnection.current!.removeTrack(sender)
+          }
+        }
+      })
     }
     console.log(' Call : setStreamToElement(videoRef, null)')
     setStreamToElement(videoRef, null)
@@ -160,9 +181,24 @@ function App() {
     (
       rtcPeerConnection: RTCPeerConnection,
     ) => {
-      // Negotiation needed イベントが発生したときのイベントハンドラの登録
+      // Negotiation needed イベントが発生した時のイベントハンドラを登録
+      rtcPeerConnection.onnegotiationneeded = () => {
+        console.log(' Event : Negotiation needed')
+
+        if (!dataChannel.current) {
+          // DataChannel が開いていないので無視する
+        }else {
+          // DataChannel が開いている
+          // OfferSDP を作成し、DataChannelを通して相手に直接送信
+          console.log(' Call : createOfferSDP()')
+          createOfferSDP(rtcPeerConnection)
+        }
+      }
+
+
+      // onconnectionstatechange イベントが発生したときのイベントハンドラの登録
       rtcPeerConnection.onconnectionstatechange = () => {
-        console.log('Event : Negotiation needed')
+        console.log('Event : onconnectionstatechange')
       }
 
       // ICE candidate イベントが発生したときのイベントハンドラの登録
@@ -171,9 +207,15 @@ function App() {
           // ICE candidate がある
           console.log('- ICE candidate : ', event.candidate)
 
-          // ICE candidate をサーバを経由して相手に送信
-          console.log('- Send ICE candidate server')
-          socket.emit('signaling', { type: 'candidate', data: event.candidate })
+          if(!isDataChannelOpen(dataChannel.current!)) {
+            // ICE candidate をサーバを経由して相手に送信
+            console.log('- Send ICE candidate server')
+            socket.emit('signaling', { type: 'candidate', data: event.candidate })
+          }else {
+            // DataChannel が開いているとき
+            console.log('- Send ICE candidate through DataChannel')
+            dataChannel.current!.send(JSON.stringify({type: 'candiate', data: event.candidate}))
+          }
         } else {
           console.log('- ICE candidate: empty')
         }
@@ -269,6 +311,19 @@ function App() {
         } else {
           console.error('Unexpected : Unknown track kind : ', track.kind)
         }
+        
+
+        stream.onremovetrack = (evt) => {
+          if (track.kind === 'video') {
+            console.log(' Call : setStreamToElement(remoteVideoRef, stream')
+            setStreamToElement(remoteVideoRef, null)
+          } else if (track.kind === 'audio') {
+            console.log(' Call : setStreamToElement(remoteAudioRef, stream')
+            setStreamToElement(remoteAudioRef, null)
+          } else {
+            console.error('Unexpected : Unknown track kind : ', track.kind)
+          }
+        }
       }
 
       rtcPeerConnection.ondatachannel = (event) => {
@@ -294,13 +349,26 @@ function App() {
         // Vanilla ICE
         // Trickle ICE
 
-        // 初期OfferSDPをサーバを経由して相手に送信
-        console.log('- Send Offer SDP to server')
-        socket.emit('signaling', { type: 'offer', data: rtcPeerConnection.localDescription })
+        if (!isDataChannelOpen(dataChannel.current!)) {
+          // DataChannel が開いていないとき
+          // 初期OfferSDPをサーバを経由して相手に送信
+          console.log('- Send Offer SDP to server')
+          socket.emit('signaling', { type: 'offer', data: rtcPeerConnection.localDescription })
+        }else {
+          // DataChannel が開いているとき
+          console.log(' - Send OfferSDP through DataChannel')
+          dataChannel.current!.send(JSON.stringify({type: 'offer', data: rtcPeerConnection.localDescription}))
+        }
       })
       .catch((error) => {
         console.error(' Error : ', error)
       })
+  }
+
+  const isDataChannelOpen = (dataChannel: RTCDataChannel) => {
+    if(!dataChannel) return false
+    if(dataChannel.readyState !== 'open') return false
+    return true
   }
 
   // OfferSDPの設定とAnswerSDPの作成
@@ -321,10 +389,15 @@ function App() {
         .then(() => {
           // Vanilla ICE 
           // Trickle ICE
-
-          // 初期AnswerSDPをサーバを経由して相手に送信
-          console.log('- Send AnswerSDP to server')
-          socket.emit('signaling', { type: 'answer', data: rtcPeerConnection.localDescription })
+          if (!dataChannel.current) {
+            // 初期AnswerSDPをサーバを経由して相手に送信
+            console.log('- Send AnswerSDP to server')
+            socket.emit('signaling', { type: 'answer', data: rtcPeerConnection.localDescription })
+          }else {
+            // DataChannel が開いているとき
+            console.log('- Send AnswerSDP through DataChannel')
+            dataChannel.current.send(JSON.stringify({type: 'answer', data: rtcPeerConnection.localDescription}))
+          }
         })
         .catch((error) => {
           console.error('Error : ', error)
@@ -408,6 +481,18 @@ function App() {
         // 受信メッセージをメッセージテキストエリアへ追加
         const strMessage = objData.data
         textAreaMessageReceived.current!.value = strMessage + textAreaMessageReceived.current!.value
+      }else if (objData.type === 'offer') {
+        // 受信した OfferSDP の設定と AnswerSDP の作成
+        console.log(' Call : setOfferSDPandCreateAnswerSDP()')
+        setOfferSDPandCreateAnswerSDP(peerConnection.current!, objData.data)
+      }else if (objData.type === 'answer') {
+        // 受信したAnswerSDP の設定
+        console.log(' Call : setAnwerSDP()')
+        setAnswerSDP(peerConnection.current!, objData.data)
+      }else if (objData.type === 'candidate') {
+        // 受信した ICE candidate の追加
+        console.log(' Call : addCandidate()')
+        addCandidate(peerConnection.current!, objData.data)
       }
     }
   }
